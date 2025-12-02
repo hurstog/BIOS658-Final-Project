@@ -8,6 +8,7 @@
     #Results of functional enrichment analysis (GSEA2_proj_deg.xlsx): from "functional_analysis.r"
   #Outputs:
     #CSV of gene expression analysis results (DGE_results.csv): contains log2fold change, p-value, adjusted p-value, FDR, ensemble gene IDs, HGNC Gene Symbols,     etc.)
+    #PNGs of bar graphs made from functional analysis results
 
 # functional_analysis.r:
   #Description: This file takes the results of the differential gene expression and conducts functional enrichment analysis. Results are generated fro KEGG       pathways and three gene ontologies using both GSEA and overrepresentation analysis. Results are saved as an excel file.
