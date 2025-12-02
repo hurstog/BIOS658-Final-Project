@@ -226,7 +226,8 @@ ggplot(plot_df, aes(x = gene, y = expression, fill = group)) +
   geom_boxplot(outlier.shape = NA) +
   theme_bw() +
   labs(title = "Top 10 Differentially Expressed Genes",
-       y = "Expression") 
+       y = "Expression") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
 #Export results as CSV file
 write.csv(dge_res, file = "DGE_results.csv", row.names = FALSE)
 #We will also create a volcano plot of the results 
