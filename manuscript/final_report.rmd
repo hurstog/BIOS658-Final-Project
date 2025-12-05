@@ -1,0 +1,361 @@
+---
+title: "BIOS 658 Final Project"
+author: "Oliver Hurst"
+date: "2025-12-01"
+bibliography: references.bib
+link-citations: TRUE
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#Execute cod needed to produce plots and figures included in the report
+##### Load required packages 
+library(GEOquery)
+library(SummarizedExperiment)
+library(ggplot2)
+library(edgeR)
+library(genefilter)
+library(dplyr)
+library(pheatmap)
+library(pander)
+library(ggrepel)
+library(sva)
+library(biomaRt)
+library(tidyverse)
+library(writexl)
+library(enrichR) 
+library(annotables)
+library(clusterProfiler)
+library(DOSE)
+library(HGNChelper)
+library(msigdbr)
+library(nichenetr)
+library(enrichplot)
+library(ensembldb)
+library(readxl)
+library(ggVolcano)
+
+##### Downloading and Preparing data
+#Load Pheno data from GEO
+GSE <- "GSE267064"
+gse <- getGEO(GSE, GSEMatrix = TRUE, getGPL = FALSE)
+expres_set <- gse[[1]]
+pheno_data <- pData(expres_set)
+
+#Load the raw data of gene expressions
+raw_data <- read.csv("GSE267064_processed_counts.csv", row.names = 1)
+count_data <- as.matrix(raw_data[, c(4:18)])
+
+#We will remove the samples with 662 transfection since we are not interested in them
+pheno_data <- pheno_data[-c(which(grepl("662", pheno_data[, 50]))), ]
+count_data <- count_data[, -c(which(grepl("662", colnames(count_data))))]
+
+#Create log2 transformed data for visualization 
+log_data <- log2(count_data + 1)
+
+#Create summarized experiment
+#Change rownames of pheno data to match the samples in the count data (make sure they match)
+rownames(pheno_data) <- pheno_data$title
+rownames(pheno_data)
+colnames(count_data)
+#Must change the colnames of count data to match the row names of pheno data
+columns <- colnames(count_data)
+columns <- gsub("\\.", "-", columns)
+colnames(count_data) <- columns 
+
+#Now create the SE object
+se <- SummarizedExperiment(
+  assays = list(counts = count_data), colData = pheno_data)
+
+#Create vectors for experimental conditions
+treatment <- c("Control", "Treatment", "Control", "Treatment", "Control", 
+               "Treatment", "Control", "Treatment", "Control", "Treatment",
+               "Control", "Treatment")
+genotype <- pheno_data[, 48]
+#Combine them to one data frame
+sample_annotations <- data.frame(
+  Treatment = treatment,
+  Genotype = genotype)
+
+#Quality assessment:
+#Library sizes:
+#Calculate the sizes
+lib_size <- matrix(data = NA, nrow = 12, ncol = 2)
+lib_size[, 1] <- columns
+colnames(lib_size) <- c("Sample", "Sum")
+for (i in 1:12) {
+  lib_size[i, 2] <- sum(count_data[, i])
+}
+#Create a dataframe and then visualize the library size
+lib_size <- as.data.frame(lib_size)
+lib_size$Sum <- as.numeric(lib_size$Sum)
+
+#Min and max library size
+min(lib_size$Sum)
+max(lib_size$Sum)
+#Count Distribution: 
+#Use the log2 transformed count data and create a boxplot of the count distribution of sample 
+c_dist_data <- log_data
+colnames(c_dist_data) <- c("Control1", "Treat1", "Control2", "Treat2",
+                           "Control3", "Treat3", "Control4", "Treat4",
+                           "Control5", "Treat5", "Control6", "Treat6")
+
+#Sample correlation:
+#Filter and normalize the gene counts
+dge = DGEList(counts = count_data, genes = rownames(count_data))
+keep <- filterByExpr(dge)  #Keep 12899 genes
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+dge = calcNormFactors((dge), method = "TMM")
+dge = estimateDisp(dge)
+#Get normalized CPMs 
+mtx <- cpm(dge, log = TRUE, normalized.lib.sizes = TRUE)
+rownames(mtx) <- dge@.Data[[3]][, "genes"]
+
+#Plot the normalized gene counts to compare with raw data
+cpm_data <- mtx
+colnames(cpm_data) <- c("Control1", "Treat1", "Control2", "Treat2",
+                           "Control3", "Treat3", "Control4", "Treat4",
+                           "Control5", "Treat5", "Control6", "Treat6")
+
+#Filter out genes with low variation
+mtx_to_plot <- varFilter(mtx, var.cutoff = 0.75)
+#Now calculate correlation matrix and present as a heatmap
+IAC <- mtx_to_plot %>% cor(. , use = "pairwise.complete.obs",  method = "pearson") 
+plot_annotations <- data.frame(Sample = sample_annotations$Treatment)
+rownames(plot_annotations) <- rownames(IAC)
+
+#PCA:
+#Perform PCA
+pca <- prcomp(scale(t(mtx)))
+summary(pca)$importance[,1:5] %>% pander
+#Present a plot of the results
+colorby <- "cells"
+
+#Perform hierarchical clustering on top 10% of genes (by variance)
+gene_var <- apply(mtx, 1, var)
+cutoff <- quantile(gene_var, 0.90)
+top10_counts <- mtx[gene_var >= cutoff, ]
+hclust.average <- hclust(dist(t(top10_counts)), method = "average")
+hclust.average$height
+
+#Note that we did not need to redo the PCA or hierarchical clustering since we found no significant batches
+
+#Perform differential expression analysis using edgeR
+#We use the dge from above and create a design matrix for the conditions of interest
+design <- model.matrix(~ Genotype + Treatment, data = sample_annotations)
+dge2 <- estimateDisp(dge, design)
+fit <- glmFit(dge2, design)
+qlf <- glmLRT(fit, coef= ncol(design))   
+edgeR_full <- topTags(qlf, n = Inf)
+dge_res <- edgeR_full$table
+
+#Calculate the total number of DEGs
+sum(dge_res$FDR < 0.05) #696
+
+#Add gene symbols to the table
+mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+bm_annotations <- getBM(
+  attributes = c("hgnc_symbol", "ensembl_gene_id"), 
+  filters = "ensembl_gene_id", 
+  values = dge_res$genes, 
+  mart = mart)
+colnames(bm_annotations) <- c("Gene_Symbol", "genes")
+dge_res <- left_join(dge_res, bm_annotations, by = "genes")
+#Create box plots of the top 10 DEGs
+#We first need to record which are the 10 most significant and create a dataframe to create the plots
+dge_res <- dge_res[order(dge_res$FDR), ]
+top10_genes <- dge_res$genes[1:10]
+top10_expr <- mtx[top10_genes, ]
+plot_df <- as.data.frame(top10_expr) %>%
+    rownames_to_column("gene") %>%
+    pivot_longer(-gene, names_to = "sample", values_to = "expression")
+group <- rep(c("Control", "Treatment"), times = 60)
+plot_df <- cbind(plot_df, group)
+
+#We will also create a volcano plot of the results 
+dge_res$FDR <- as.numeric(dge_res$FDR)
+data <- add_regulate(data = dge_res, log2FC_name = "logFC",
+                     fdr_name = "FDR", log2FC = 1, fdr = 0.3)
+
+# plot
+volplot <- gradual_volcano(data, x = "log2FoldChange", y = "padj",
+                label = "Gene_Symbol", label_number = 10,
+                fills = c("#53a4cf", "#aec5d1", "white", "#e2ae96", "#cc917c", "#a96d5d", "#91403e"),
+                colors = "#404950",
+                log2FC_cut = 0, FDR_cut = 1, add_line = FALSE, pointSizeRange = c(2, 2))
+
+```
+
+# Project Report
+
+## Introduction
+
+Breast cancer is an incredibly common cancer in the United States with an estimated 316,950 new cases thus far in 2025, accounting for 15.5% of all cancer diagnoses [@nciCancerBreastFemale]. Thus, research in this type of cancer is vital to increasing the overall health of the nation. A key area of interest now is in metastasis of the cancer, which is when the tumor spreads from the original site. For breast cancer, the most common type of metastasis is the tumor spread to bone, or bone metastasis[@clezardinBoneMetastasisMechanisms2021]. Additionally, as science and medicine have developed, we now have the tools to identify the genetic and molecular causes of breast cancer and create then create targeted therapies to combat such causes. Thus, we are interested in identifying genes associated with bone metastasis in breast cancer patients.
+
+Past research has shown that microRNAs (miRNAs), which are small pieces of RNA that can block the protein production of messenger RNA, are dysregulated in cancer[@DefinitionMicroRNANCI2011; @puppoMicroRNAsTheirRoles2021a]. Furthermore, researchers have identified the miRNA strand miR-24-2-5p as potentially inhibiting tumor progression when overexpressed [@puppoProtectiveEffectsMiR2425p2024]. Thus, in this study we are interested in exploring which genes are differentially expressed between cells with miR-24-2-5p overexpression and those without, while controlling for the cell's genotype. We will also explore the pathways and gene ontologies most differentially expressed.
+
+## Methods
+
+### Data
+
+We obtained data from the study of Puppo et al., which found that overexpression of miR-24-2-5p reduced bone metastasis of breast cancer [@puppoProtectiveEffectsMiR2425p2024]. The dataset originally contained 15 samples, six with over expressed miR-24-2-5p (treatment), six without (control), and three with miR-662, which were removed from analysis because that miRNA strand had been studied extensively and has a small sample size. Additionally, samples belonged to one of two genotypes: Luc2-NW1 and Luc2. There were six samples for each genotype. We are primarily interested in identifying the most differentially expressed genes between the treatment and control groups after controlling for genotype.\
+
+### Quality Assesment
+
+We will assess the quality of the data by examining the library size of each sample, the distribution of the gene counts within samples, the correlation between samples, and conducting principal component analysis (PCA). Ideally the library size and distribution of gene counts within samples should be relatively equal between samples. Additionally, we expect that samples in the treatment group to be highly correlated with other treatment samples and not correlated with control samples. After conducting PCA, we expect to see that samples from the same biological group (such as genotype) to cluster together.\
+
+### Preprocessing
+
+Before we begin more in depth analysis, we will first filter our genes to ensure that low expressed genes are not considered in analysis. This will ensure that we preserve our statistical power to identify differently expressed genes. We will require a minimum count for at least some samples of 10 and a minimum total count across all samples of 15. Then we will normalize the data using the trimmed mean of M-values (TMM) method. This is the standard method of normalization for RNASeq data. Normalization will ensure that our results are not skewed by outliers.\
+
+### Batch Effect Correction
+
+Our data does not appear to have any obvious batch effects, so we will use Surrogate Variable Analysis (SVA) to identify any batch effects in our data. We will then remove the batch effects. To verify that we correctly removed any batch effects we will also conduct PCA again and compare our results. PCA offers a visual way of checking whether the batch effect has been removed since we are looking for biological groups to cluster with each other. We will also conduct heirarchical clustering using the average linkage method both before and after correcting for the batch affects. Samples from the same biological groups should be clustered together.\
+
+### Differential Analysis
+
+Now we will be ready to perform differential gene expression analysis using edgeR. EdgeR tends to be more robust with smaller sample sizes, so it is appropriate for our study. We will filter out genes as described above to remove lowly expressed genes. This will ensure that we conduct fewer statistical tests, so we will preserve our power to make inference on truly differntially expressed genes. We will use the False Discovery Rate (FDR) to correct for multiple comparisons. This is a very common method to accomplish this and will preserve power while maintaining a low Type 1 error rate.\
+
+### Functional Enrichment Analysis
+
+Finally we will explore which type of genes are differentially expressed. We will perform both overreprensation analysis based on the hypergeometric distribution and gene set enrichment analysis (GSEA) using Kegg pathways and three gene ontology domains (biological processes, molecular function, and cellular component). This will inform us as to what the differentially expressed genes mean in context.\
+
+All analyses will use ${\alpha} = 0.05$ and will be conducted in R version 4.5.1 [@RCoreTeam2025]. Our data, analysis code, and the results of differential expression analysis and the results of functional enrichment analysis can be found on GitHub at [this link.](https://github.com/hurstog/BIOS658-Final-Project)
+
+## Results
+
+### Data assessment, preprocessing, and batch affect correction
+
+The distribution of library sizes and the distribution of gene counts within samples are seen in the figures below. We see that the library size of sample varies between each sample. The smallest library size is 13,944,515 and the largest is 18,955,021. Additionally, we see that that the distribution of gene counts of each sample is highly skewed. These results are consistent with what we expect from gene expression data, but they highlight the need to normalize the data.
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(lib_size, aes(x = Sample, y = Sum)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Sample", y = "Sum of Counts", title = "Sum of Counts by Sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + coord_flip()
+boxplot(c_dist_data,
+        las = 2,
+        outline = FALSE,
+        main = "Log2 Gene Counts per Sample",
+        ylab = "log2(count + 1)")
+```
+
+After we filtered the data to remove lowly expressed genes and normalized the data using TMM, we had normalized gene counts we could use in future analysis. After filtering, we retained data for 12,899 genes, compared to our original 66,963 genes. We calculated the normalized counts per million reads (CPM). That way we could visualize the distribution of the normalized gene counts of each sample, as seen in the figure below. We see that the CPM distribution is much more symmetric for each sample and each sample has similar median, min, and max CPM.
+
+```{r, echo=FALSE, warning=FALSE}
+boxplot(cpm_data,
+        las = 2,
+        outline = FALSE,
+        main = "Counts per million per Sample",
+        ylab = "CPM")
+```
+
+Next, we created a heat map that visualized the pair wise correlation coefficient, as calculated by the Pearson meth, between each sample. The heatmap demonstrates that MDA samples are highly correlated with other MDA samples and weakly correlated with MCF7 samples. On the other hand, MCF7 samples are highly correlated with other MCF7 samples and weakly correlated with MDA samples. Further investigating this shows that MDA samples correspond to those with the genotype Luc2-NW1 while MCF7 samples correspond to the Luc2 genotype. Therefore, the correlation matrix presented in the heat map make sense given our data. The samples from the same genotype are highly correlated.
+
+```{r, echo=FALSE, warning=FALSE}
+pheatmap(IAC,annotation_col = plot_annotations, clustering_method = "ward.D")
+```
+
+Principal component analysis resulted in the top 5 principal components explaining 92.52% of the variance in the data. The plots of this analysis is seen below. We expect that samples that are in the same biological groups to be clustered. When we color the plot based on sample genotype, we see that the two genotypes are highly clustered together. When we color the plot based on treatment group we again see that treatment samples tend to be clustered together and control samples tend to be clustered together.
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(
+  data = data.frame(pca$x, cells = sample_annotations$Genotype, samples = sample_annotations$Genotype),
+  aes(x = PC1, y = PC2, label = samples)
+) +
+  theme(plot.title = element_text(face = "bold")) +
+  ggtitle("PCA colored by sample genotype") +
+  geom_point(aes(color = cells), size = 3) +
+  geom_text_repel(size = 3) +
+  geom_hline(yintercept = 0, color = "gray65") +
+  geom_vline(xintercept = 0, color = "gray65") +
+  scale_x_continuous(
+    name = paste0("PC1 (", round(summary(pca)$importance[2,1]*100, 2), "%)")
+  ) +
+  scale_y_continuous(
+    name = paste0("PC2 (", round(summary(pca)$importance[2,2]*100, 2), "%)")
+  )
+ggplot(
+  data = data.frame(pca$x, cells = sample_annotations$Treatment, samples = sample_annotations$Treatment),
+  aes(x = PC1, y = PC2, label = samples)
+) +
+  theme(plot.title = element_text(face = "bold")) +
+  ggtitle("PCA colored by treatment group") +
+  geom_point(aes(color = cells), size = 3) +
+  geom_text_repel(size = 3) +
+  geom_hline(yintercept = 0, color = "gray65") +
+  geom_vline(xintercept = 0, color = "gray65") +
+  scale_x_continuous(
+    name = paste0("PC1 (", round(summary(pca)$importance[2,1]*100, 2), "%)")
+  ) +
+  scale_y_continuous(
+    name = paste0("PC2 (", round(summary(pca)$importance[2,2]*100, 2), "%)")
+  )
+```
+
+We also performed hierarchical clustering based on the top 10% of most variable genes. We used the average linkage method and euclidean distance to accomplish this clustering. The dendrograph created based on these clusters are presented below. The figure shows that MCF7 samples are clustered together and that MDA samples are clustered together, which is similar to what the correlation matrix above demonstrated. Again, this makes sense because MCF7 samples correspond to one genotype (Luc2-NW1) and MDA samples correspond to a genotype (Luc).
+
+```{r, echo=FALSE, warning=FALSE}
+plot(hclust.average, main = "Average Linkage Dendrogram",
+     xlab = "Observation", ylab = "Distance")
+```
+
+The results of PCA and hierarchical clustering indicated that we likely did not have batch effects in our data. This is because these analyses resulted in grouping based on the biological groups we have defined. That said, we used surragate variable analysis (SVA) to rigorously check for batch effects since we did not have any information about batches from the data. Our analysis affirmed that there were no batch effects in the data. Therefore, we did not correct for any effects. Additionally, we did not need to redo PCA and hierarchical clustering to confirm batch effects were removed.
+
+### Differential expression analysis
+
+Once we ensured the quality of the data and confirmed that there were no batch effects present in the data, we were able to conduct differential expression analysis. Because of our small sample size we used edgeR, given that it is considered robust in small samples. As mentioned above, we removed lowly expressed genes. Such genes are not going to be significantly different between our groups of interest. Removing them helps us preserve statistical power to find truly differently expressed genes while still minimizing Type I error. We used the false discovery rate (FDR) to correct for the thousands of multiple tests we conducted. This is a commonly used method in gene expression analysis since it controls the Type I error rate while preserving power. We ultimately found 696 differntly expressed genes. We created boxplots (seen in the figure below) to visualize the distribution of the top 10 differentially expressed genes between the treatment groups. Overall, we see that the treatment group tends to have lower expression levels compared to the control group.
+
+```{r, echo=FALSE, warning=FALSE, out.width="80%"}
+ggplot(plot_df, aes(x = gene, y = expression, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_bw() +
+  labs(title = "Top 10 Differentially Expressed Genes",
+       y = "Expression")  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+```
+
+Overall, we see that the treatment group tends to have lower expression levels compared to the control group. This is similarly seen in the volcano plot, seen below. This is consistent with what the article we sourced the data found [@cite]. In fact, they pointed out many of the same genes labeled in the volcano plot below. This makes sense given that miRNA tend to inhibit protein production.
+
+```{r, echo=FALSE, warning=FALSE}
+volplot + theme(legend.position = "right")
+```
+
+### Functional enrichment analysis
+
+Finally, we conducted functional enrichment analysis using the data generated from our differential expression analysis. We performed both GSEA and overrepresentation analysis using four different paradigms: three gene ontology domains (biological processes, molecular function, and cellular component) and KEGG pathways. For each case the differential expression results were prepared the same way. First we removed genes without a Gene Symbol. Then we sorted the genes from most to lease significant (based on the FDR value) and kept only unique genes. The first instance of each gene was included for enrichment analysis, ensuring the most significant p-value was kept for each gene. Thus, we generated eight sets of results total. For each case we present a bar chart showing the most significant pathways below. While each method yielded different, which is expected, we see that the differentially expressed genes largely were related to the cell cycle.
+
+```{r, , echo=FALSE, out.width="45%", fig.show="hold"}
+knitr::include_graphics("Enrich.KEGG_top10_pathways.png")
+knitr::include_graphics("Enrich.C2_top10_pathways.png")
+```
+
+```{r, , echo=FALSE, out.width="45%", fig.show="hold"}
+knitr::include_graphics("Enrich.C5_top10_pathways.png")
+knitr::include_graphics("Enrich.H_top10_pathways.png")
+```
+
+```{r, , echo=FALSE, out.width="45%", fig.show="hold"}
+knitr::include_graphics("GSEA.KEGG_top10_pathways.png")
+knitr::include_graphics("GSEA.C2_top10_pathways.png")
+```
+
+```{r, , echo=FALSE, out.width="45%", fig.show="hold"}
+knitr::include_graphics("GSEA.C5_top10_pathways.png")
+knitr::include_graphics("GSEA.H_top10_pathways.png")
+```
+
+## Discussion
+
+Overall we were able to identify 696 diffentially expressed genes between the control and treatment groups after controlling for sample genotype. The genes we found to be differentially expressed were typically underexpressed in the treatment group, or samples oversaturated with the miRNA strands miR-24-2-5p. Additionally, the genes we identified as being expressed differently largely matched the genes found by the researchers who published this data. It makes sense that overexpression of miR-24-2-5p would lead to gene underexpression given the role of miRNA in supressing protein production by messenger RNA.
+
+We learned from the functional enrichment analysis of our differential expression analysis that most of the significant pathways identified were related to the cell cycle in some way or another. For example, some identified pathways included cell cycle progression, DNA replication, cell signalling, and DNA repair. This could explain why overexpression of miR-24-2-5p has been shown to be protective against breast cancer bone metasisis. Perhaps overexpressing miR-24-2-5p makes it difficult for tumerous cells to replicate, making it more difficult for them to metasisize.\\ This research could help shed light onto the properties of miR-24-2-5p overexpression and why it is associated with lower rish of bone metastasis. That said, there are limitations associated woth this study. For one, we are limited by the small sample size of data available. In the future it would be interesting to expand this work by expanding the sample size. Additionally, work should be done investigating methods of increasing the expression of miR-24-2-5p in breast cancer tissue. That way potential therapies can be derived from this miRNA and the research we have discussed.
+
+In conclusion, our results align closely with prior literature, including the source of this data. Understanding how miR-24-2-5p expression affects breast cancer cells offer an exciting opportunity for drug development to prevent bone metastasis in breast cancer patients.
+
+## References
